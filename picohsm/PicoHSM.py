@@ -182,27 +182,6 @@ class PicoHSM:
 
         self.send(cla=0x80, command=0x50, data=data)
 
-        if (not no_dev_cert):
-            response = self.get_contents(DOPrefixes.EE_CERTIFICATE_PREFIX, 0x00)
-
-            cert = bytearray(response)
-            Y = CVC().decode(cert).pubkey().find(0x86).data()
-            #print(f'Public Point: {hexlify(Y).decode()}')
-
-            pbk = base64.urlsafe_b64encode(Y)
-            params = {'pubkey': pbk}
-            if (self.__card.platform in (Platform.RP2350, Platform.ESP32, Platform.EMULATION)):
-                params['curve'] = 'secp256k1'
-            data = urllib.parse.urlencode(params).encode()
-            j = get_pki_data('cvc', data=data)
-            #print('Device name: '+j['devname'])
-            dataef = base64.urlsafe_b64decode(
-                j['cvcert']) + base64.urlsafe_b64decode(j['dvcert']) + base64.urlsafe_b64decode(j['cacert'])
-
-            self.select_file(0x2f02)
-            response = self.put_contents(0x0000, data=dataef)
-
-
     def login(self, pin=None, who=PinType.USER_PIN):
         if (pin is None):
             pin = self.__pin
@@ -933,7 +912,7 @@ class PicoHSM:
             p2 = 0x4
         elif (subcommand == 'led_brightness'):
             p2 = 0x5
-        elif (subcommand == 'wcid' or subcommand == 'led_dimmable'):
+        elif (subcommand == 'led_dimmable'):
             p2 = 0x6
             if (val is not None):
                 resp = self.send(cla=0x80, command=0x64, p1=0x1B, p2=p2)
@@ -942,9 +921,7 @@ class PicoHSM:
                 else:
                     opts = 0
                 opt = 0
-                if (subcommand == 'wcid'):
-                    opt = PhyOpt.WCID
-                elif (subcommand == 'led_dimmable'):
+                if (subcommand == 'led_dimmable'):
                     opt = PhyOpt.DIMM
                 if (val):
                     opts |= opt
@@ -957,83 +934,6 @@ class PicoHSM:
         else:
             resp = self.send(cla=0x80, command=0x64, p1=0x1B, p2=p2)
         return resp
-
-    def otp(self, row, data=None, raw=False, redundant=0, length=16):
-        p2 = 0x1 if raw else 0x0
-        payload = list(row.to_bytes(2, 'big'))
-        if (data):
-            align = (4 if raw else 2)
-            if (len(data) % align != 0):
-                raise ValueError(f"Data length must be a multiple of {align}")
-            self.send(cla=0x80, command=0x64, p1=0x4C, p2=p2, data=payload+list(data))
-            for r in range(redundant):
-                self.otp(row+r+1, data, raw=raw, redundant=0)
-        else:
-            resp = self.send(cla=0x80, command=0x64, p1=0x4C, p2=p2, ne=length, data=payload)
-            for r in range(redundant):
-                retr = self.otp(row+r+1, raw=raw, redundant=0, length=length)
-                if (retr != resp):
-                    raise ValueError("OTP register mismatch")
-            return resp
-
-    def _otp_register(self, row, length, raw=False, redundant=0):
-        ret = []
-        irow = row
-        align = (4 if raw else 2)
-        while len(ret) < length:
-            resp = self.otp(irow, raw=raw, redundant=redundant, length=align)
-            bts = min(length-len(ret), len(resp))
-            ret += resp[:bts]
-            irow += 1
-        return ret
-
-    def secure_boot(self, bootkey_hash, bootkey_index=0, lock=False):
-        # Write bootkey hash
-        if (len(bootkey_hash) != 32):
-            raise ValueError("Bootkey hash must be 32 bytes")
-        if (bootkey_index not in [0,1,2,3]):
-            raise ValueError("Bootkey index must be between 0 and 3")
-        row_index = [0x80, 0x90, 0xA0, 0xB0]
-        self.otp(row_index[bootkey_index], bootkey_hash)
-        bootkey = self._otp_register(row_index[bootkey_index], 32)
-        assert(bootkey == bootkey_hash)
-
-        # Write bootkey valid
-        resp = self._otp_register(0x4b, 3, raw=True, redundant=2)
-        boot_flag1 = resp[0] | (0x01 << bootkey_index)
-        self.otp(0x4b, [boot_flag1, resp[1], resp[2], 0], raw=True, redundant=2)
-
-        # Enable secure boot
-        resp = self._otp_register(0x40, 3, raw=True, redundant=7)
-        secure_boot_enable = resp[0] | 0x01
-        self.otp(0x40, [secure_boot_enable, resp[1], resp[2], 0], raw=True, redundant=7)
-
-        if (lock):
-            inp = input("This will lock the chip without possibility to add more bootkeys and will run only with Pico Keys firmware. Type 'LOCK' to continue: ")
-            if (inp != "LOCK"):
-                print('Aborted')
-                return
-
-            # Disable debug, enable glitch detector and set glitch sensitivity
-            debug_disable = (0x01 << 2)
-            glitch_detector = (0x01 << 4)
-            glitch_sens = (0x3 << 5)
-            resp = self._otp_register(0x40, 3, raw=True, redundant=7)
-            flags = resp[0] | debug_disable | glitch_detector | glitch_sens
-            self.otp(0x40, [flags, resp[1], resp[2], 0], raw=True, redundant=7)
-
-            # Invalid all remaining keys
-            resp = self._otp_register(0x4b, 3, raw=True, redundant=2)
-            key_invalid = resp[1] | (0xF & (~(0x01 << bootkey_index)))
-            self.otp(0x4b, [resp[0], key_invalid, resp[2], 0], raw=True, redundant=2)
-
-            # Lock Page 1 & 2
-            resp = self._otp_register(0xf83, 3, raw=True)
-            flags = resp[0] | 0x10
-            self.otp(0xf83, [flags, flags, flags, 0], raw=True)
-            resp = self._otp_register(0xf85, 3, raw=True)
-            flags = resp[0] | 0x10
-            self.otp(0xf85, [flags, flags, flags, 0], raw=True)
 
     def reboot(self):
         self.send(cla=0x80, command=0x64, p1=0xFB)
